@@ -122,7 +122,6 @@ def get_lr_scheduler(optimizer, args):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda x:  (args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay)))
     return scheduler
 
-
 def test(model, target_test_loader, args):
     model.eval()
     test_loss = AverageMeter()
