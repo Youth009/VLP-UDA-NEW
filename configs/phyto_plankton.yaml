@@ -1,5 +1,5 @@
 # datasets
-datasets: office_home
+datasets: phyto_plankton
 
 # Backbone
 model_name: VIT-B
@@ -29,4 +29,4 @@ n_epoch: 20
 
 # Others
 seed: 42
-num_workers: 4
+num_workers: 0

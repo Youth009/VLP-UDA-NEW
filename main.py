@@ -29,7 +29,7 @@ def get_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--log_dir', type=str, default='log')
-    parser.add_argument('--datasets', type=str, default='office_home',choices=["office_home","office31","visda",
+    parser.add_argument('--datasets', type=str, default='office_home',choices=["office_home","phyto_plankton","office31","visda",
                                                                                "domain_net","digits","image_clef"])
     parser.add_argument('--use_amp', type=str2bool, default=False)
 
@@ -110,7 +110,6 @@ def load_data(args):
 def get_model(args):
     model = TransferNet(args).to(args.device)
     return model
-
 
 def get_optimizer(model, args):
     initial_lr = args.lr if not args.scheduler else 1.0
@@ -194,6 +193,9 @@ def train(source_loader, target_train_loader, target_test_loader, model, optimiz
     for e in range(1, args.n_epoch+1):
         if args.pda:
             assert args.datasets=="office_home"
+            label_set = obtain_label(model, target_test_loader, e, args)
+        elif args.pda:
+            assert args.datasets == "phyto_plankton"
             label_set = obtain_label(model, target_test_loader, e, args)
         else:
             label_set = None
