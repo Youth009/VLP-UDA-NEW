@@ -81,7 +81,7 @@ def get_parser():
     parser.add_argument('--lambda3', type=float, default=0.025)
     parser.add_argument('--clf_loss', type=str, default="cross_entropy")
     ### MODIFY ### 新增阶段划分参数
-    parser.add_argument('--stage1_epochs', type=int, default=4,
+    parser.add_argument('--stage1_epochs', type=int, default=10,
                         help='前多少个 epoch 用"阶段一"训练')
     # learning rate scheduler related
     parser.add_argument('--scheduler', type=str2bool, default=True)
