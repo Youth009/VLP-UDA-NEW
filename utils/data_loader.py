@@ -1,5 +1,6 @@
 from torchvision import datasets, transforms
 import torch
+from typing import Optional
 import numpy as np
 from utils.FixMatch import TransformFixMatch
 import torch.nn as nn
@@ -183,18 +184,19 @@ class _InfiniteSampler(torch.utils.data.Sampler):
             for batch in self.sampler:
                 yield batch
 
+
 class InfiniteDataLoader:
     def __init__(self, dataset, batch_size, shuffle=True, drop_last=False, num_workers=0, weights=None, **kwargs):
         self.dataset = dataset
         self.num_workers = num_workers
         if weights is not None:
             sampler = torch.utils.data.WeightedRandomSampler(weights,
-                replacement=False,
-                num_samples=batch_size)
+                                                             replacement=False,
+                                                             num_samples=batch_size)
         else:
             sampler = torch.utils.data.RandomSampler(dataset,
-                replacement=False)
-            
+                                                     replacement=False)
+
         self.batch_sampler = torch.utils.data.BatchSampler(
             sampler,
             batch_size=batch_size,
