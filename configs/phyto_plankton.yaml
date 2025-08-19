@@ -11,7 +11,7 @@ l_batch_size: 16
 u_batch_size: 16
 # Loss related
 lambda1: 0.25
-lambda2: 0.1
+lambda2: 1.0 # 0.1->1.0
 lambda3: 0.025
 # scheduler related
 scheduler: True

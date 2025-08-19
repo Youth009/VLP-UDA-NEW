@@ -206,7 +206,7 @@ class InfiniteDataLoader:
             self.dataset,
             num_workers=num_workers,
             batch_sampler=_InfiniteSampler(self.batch_sampler),
-            pin_memory=True,
+            pin_memory=False,
             prefetch_factor=2
         ))
 

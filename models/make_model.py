@@ -18,9 +18,9 @@ def weights_init_classifier(m):
             nn.init.constant_(m.bias, 0.0)
 
 def fix_bn(m):
-    # 在训练两个阶段时，BN 层都置为 eval
-    if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
-        m.eval()
+    if isinstance(m, nn.BatchNorm2d):
+        m.eval()  # 固定 running mean/var
+        m.requires_grad_(True)  # 保持可学习的 gamma/beta
 
 class TransferNet(nn.Module):
     def __init__(self, args, train=True):
@@ -36,13 +36,23 @@ class TransferNet(nn.Module):
         )
         self.classifier_layer.apply(weights_init_classifier)
         # 对抗判别器
-        D_hidden = 512
+        # D_hidden = 512
         feat_dim = self.base_network.output_num
+        # self.domain_discriminator = nn.Sequential(
+        #     nn.Linear(feat_dim, D_hidden),
+        #     nn.ReLU(inplace=True),
+        #     nn.Linear(D_hidden, 1),
+        # )
         self.domain_discriminator = nn.Sequential(
-            nn.Linear(feat_dim, D_hidden),
+            nn.Linear(feat_dim, 512),
             nn.ReLU(inplace=True),
-            nn.Linear(D_hidden, 1),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, 1),
         )
+
         # 损失
         if train:
             self.clf_loss = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -100,6 +110,7 @@ class TransferNet(nn.Module):
         # 3.送入域判别器
         Dm = self.domain_discriminator(grl_m).view(-1)
         Dt = self.domain_discriminator(grl_t).view(-1)
+        # print(f"Dm: {Dm.mean().item()}, Dt: {Dt.mean().item()}")
 
         # 4. 计算域对抗损失
         bce = nn.BCEWithLogitsLoss() # 二元交叉熵 (BCE)损失
@@ -107,7 +118,7 @@ class TransferNet(nn.Module):
 
         transfer_loss = self.args.lambda3 * loss_adv
         # rain() 里按 clf_loss + transfer_loss 相加
-        return loss_m, transfer_loss
+        return loss_m, transfer_loss, Dm, Dt
 
     def get_parameters(self, initial_lr=1.0):
         return [
