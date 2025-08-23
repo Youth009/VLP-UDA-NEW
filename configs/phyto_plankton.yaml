@@ -12,7 +12,7 @@ u_batch_size: 16
 # Loss related
 lambda1: 0.25
 lambda2: 1.0 # 0.1->1.0
-lambda3: 0.025
+lambda3: 0.1 # 0.025->0.1
 # scheduler related
 scheduler: True
 lr_gamma: 0.0003
@@ -23,4 +23,4 @@ n_iter_per_epoch: 500
 n_epoch: 20
 # Others
 seed: 42
-num_workers: 0
+num_workers: 4

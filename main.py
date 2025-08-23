@@ -1,6 +1,7 @@
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 import torch.multiprocessing
+import torch.nn.functional as F  # 在文件顶部添加
 torch.multiprocessing.set_sharing_strategy('file_system')
 import  copy
 import itertools
@@ -15,6 +16,7 @@ import configargparse
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from typing import Optional
 from utils import data_loader
+from utils.build_dataloaders import build_dataloaders
 from utils.tools import str2bool, AverageMeter, save_model
 from models.make_model import TransferNet, fix_bn
 import torchvision
@@ -43,6 +45,7 @@ def get_parser():
     parser.add_argument('--datasets', type=str, default='office_home',choices=["office_home","phyto_plankton","office31","visda",
                                                                                "domain_net","digits","image_clef"])
     parser.add_argument('--use_amp', type=str2bool, default=True)
+    parser.add_argument('--d_steps', type=int, default=1, help='Number of discriminator steps per generator step')
 
     # network related
     parser.add_argument('--model_name', type=str, default='RN50',choices=["RN50", "VIT-B", "RN101"])
@@ -72,6 +75,7 @@ def get_parser():
 
     # optimizer related
     parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lr_d', type=float, default=None, help='Discriminator learning rate')
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--multiple_lr_classifier', type=float, default=10)
@@ -86,6 +90,7 @@ def get_parser():
                         help='前多少个 epoch 用"阶段一"训练')
     # learning rate scheduler related
     parser.add_argument('--scheduler', type=str2bool, default=True)
+    parser.add_argument('--warmup_ratio', type=float, default=0.3,help='lambda2 的 warm-up 比例(0~1)')
 
     # linear scheduler
     parser.add_argument('--lr_gamma', type=float, default=0.0003)
@@ -140,15 +145,44 @@ def get_model(args):
     print(f"模型所在设备: {next(model.parameters()).device}")
     return model
 
-def get_optimizer(model, args):
-    initial_lr = args.lr if not args.scheduler else 1.0
-    params = model.get_parameters(initial_lr=initial_lr)
-    optimizer = torch.optim.SGD(params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
-    return optimizer
+# def get_optimizer(model, args):
+#     initial_lr = args.lr if not args.scheduler else 1.0
+#     params = model.get_parameters(initial_lr=initial_lr)
+#     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
+#     return optimizer
 
-def get_lr_scheduler(optimizer, args):
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda x:  (args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay)))
-    return scheduler
+def get_optimizers(model, args):
+    lr_g = args.lr_g if getattr(args, "lr_g", None) is not None else args.lr
+    lr_d = args.lr_d if getattr(args, "lr_d", None) is not None else args.lr * 0.1
+
+    g_params = [
+        # backbone（CLIP visual）
+        {"params": model.base_network.model.visual.parameters(), "lr": lr_g},
+        # 分类头（一定要加进来！）
+        {"params": model.classifier_layer.parameters(),
+         "lr": lr_g * args.multiple_lr_classifier},
+    ]
+    optimizer_g = torch.optim.SGD(
+        g_params, lr=lr_g, momentum=args.momentum,
+        weight_decay=args.weight_decay, nesterov=True
+    )
+
+    optimizer_d = torch.optim.Adam(
+        model.domain_discriminator.parameters(),
+        lr=lr_d, betas=(0.9, 0.999), weight_decay=1e-4
+    )
+    return optimizer_g, optimizer_d
+
+# def get_lr_scheduler(optimizer, args):
+#     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda x:  (args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay)))
+#     return scheduler
+
+def get_lr_scheduler(optimizer_g, args):
+    # 常见写法：随着 step 增加，lr 下降
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer_g,
+        lr_lambda=lambda step: (1. + args.lr_gamma * float(step)) ** (-args.lr_decay)
+    )
 
 def test(model, target_test_loader, args):
     model.eval()
@@ -193,27 +227,36 @@ def test(model, target_test_loader, args):
         else:
             return acc, test_loss.avg
 
-def obtain_label(model,loader,e,args):
-    # For partial-set domain adaptation on the office-home benchmark
+def obtain_label(model, loader, e, args):
     model.eval()
     class_set = []
-    if e==1:
-        return [i for i in range(65)]
+    if e == 1:
+        return [i for i in range(args.num_class)]  # 使用args.num_class而不是硬编码的65
+
     number_threshold = 14
-    classes_num = [0 for _ in range(65)]
+    classes_num = [0 for _ in range(args.num_class)]  # 使用args.num_class
+
     with torch.no_grad():
         for data, _ in loader:
             data = data.to(args.device)
             s_output = model.predict(data)
             preds = torch.max(s_output, 1)[1]
             for pred in preds:
-                classes_num[pred] += 1
-    for c,n in enumerate(classes_num):
+                if pred < args.num_class:  # 确保索引在有效范围内
+                    classes_num[pred] += 1
+
+    for c, n in enumerate(classes_num):
         if n >= number_threshold:
             class_set.append(c)
+
     return class_set
 
-def train(source_loader, mid_loader, target_train_loader, target_test_loader, model, optimizer, scheduler, args):
+def get_lambda2(epoch, step, max_epoch, max_step):
+    """Warm-up λ₂ (GRL 系数)"""
+    p = (epoch * max_step + step) / (max_epoch * max_step)
+    return 2. / (1. + np.exp(-10 * p)) - 1.
+
+def train(source_loader, mid_loader, target_train_loader, target_test_loader, model, optimizer_g, optimizer_d, scheduler, args):
     # ====== 日志配置 ======
     logging.basicConfig(
         filename=os.path.join(args.log_dir, 'training.log'),
@@ -224,9 +267,9 @@ def train(source_loader, mid_loader, target_train_loader, target_test_loader, mo
     n_batch = args.n_iter_per_epoch
     model.apply(fix_bn)
     # --- 自动学习率缩放 ---
-    base_bs = 8   # 假设 8 是你原来默认 batch size
+    base_bs = 8
     scale = args.l_batch_size / base_bs
-    for param_group in optimizer.param_groups:
+    for param_group in optimizer_g.param_groups:
         old_lr = param_group['lr']
         param_group['lr'] = old_lr * scale
     logging.info(f"Adjusted learning rate by batch size scale={scale:.2f}")
@@ -234,7 +277,6 @@ def train(source_loader, mid_loader, target_train_loader, target_test_loader, mo
     iter_source = itertools.cycle(source_loader)
     iter_mid    = itertools.cycle(mid_loader)
     iter_target = itertools.cycle(target_train_loader)
-    # 作用是在混合精度（尤其FP16）训练时动态调整损失缩放，防止梯度下溢并保持训练稳定。
     scaler = GradScaler(enabled=args.use_amp)
 
     best_acc = 0
@@ -243,32 +285,25 @@ def train(source_loader, mid_loader, target_train_loader, target_test_loader, mo
         torch.cuda.empty_cache()
         model.train()
 
-        # 判断是否处于阶段1
         use_stage1 = (e <= args.stage1_epochs)
 
-        # PDA label 获取
         if args.pda:
             assert args.datasets in ["office_home", "phyto_plankton"]
             label_set = obtain_label(model, target_train_loader, e, args)
         else:
             label_set = None
 
-        # 损失记录
         train_loss_clf = AverageMeter()
         train_loss_transfer = AverageMeter()
         train_loss_total = AverageMeter()
 
-        # ====== 迭代一个 epoch ======
-        for _ in tqdm(range(n_batch), desc=f"Train:[{e}/{args.n_epoch}]"):
-            # # 统一清理梯度
-            # optimizer.zero_grad(set_to_none=True)
-            # all(p.grad is None for p in model.parameters() if p.requires_grad)
+        max_step = n_batch
+        for step in tqdm(range(n_batch), desc=f"Train:[{e}/{args.n_epoch}]"):
 
             if use_stage1:
-                # ===== 阶段1：source + mid 的分类 =====
+                # ===== Stage1: source + mid 分类 =====
                 data_source, label_source = next(iter_source)
                 data_mid,    label_mid    = next(iter_mid)
-
                 data_source, label_source = data_source.to(args.device), label_source.to(args.device)
                 data_mid,    label_mid    = data_mid.to(args.device),    label_mid.to(args.device)
 
@@ -278,9 +313,9 @@ def train(source_loader, mid_loader, target_train_loader, target_test_loader, mo
                             source=data_source, mid=data_mid,
                             source_label=label_source, mid_label=label_mid
                         )
-                    optimizer.zero_grad()  # 梯度清零
+                    optimizer_g.zero_grad()
                     scaler.scale(total_loss).backward()
-                    scaler.step(optimizer)
+                    scaler.step(optimizer_g)
                     scaler.update()
                     loss = total_loss
                 else:
@@ -288,48 +323,87 @@ def train(source_loader, mid_loader, target_train_loader, target_test_loader, mo
                         source=data_source, mid=data_mid,
                         source_label=label_source, mid_label=label_mid
                     )
-                    optimizer.zero_grad()  # 梯度清零
+                    optimizer_g.zero_grad()
                     total_loss.backward()
-                    optimizer.step()
+                    optimizer_g.step()
                     loss = total_loss
 
                 clf_loss = torch.as_tensor(loss_s_val, device=args.device, dtype=loss.dtype)
                 transfer_loss = torch.tensor(0.0, device=args.device, dtype=loss.dtype)
 
             else:
-                # ===== 阶段2：mid → target 渐进对齐 =====
+                # ===== Stage2: mid → target 渐进对齐 =====
                 data_mid, label_mid = next(iter_mid)
-
                 if args.fixmatch:
                     (tgt_w, tgt_s), _ = next(iter_target)
                     data_target = tgt_w.to(args.device)
-                    # data_target_strong = tgt_s.to(args.device)  # 如果后面用，可以传
                 else:
                     data_target, _ = next(iter_target)
                     data_target = data_target.to(args.device)
-
                 data_mid, label_mid = data_mid.to(args.device), label_mid.to(args.device)
+
+                # ---- Step A: 判别器多步更新 ----
+                for _ in range(args.d_steps):
+                    with torch.no_grad():
+                        feat_m = model.base_network.forward_features(data_mid).detach()
+                        feat_t = model.base_network.forward_features(data_target).detach()
+                    feat_all = torch.cat([feat_m, feat_t], dim=0)
+                    domain_labels = torch.cat([
+                        torch.zeros(feat_m.size(0)),
+                        torch.ones(feat_t.size(0))
+                    ]).to(args.device)
+
+                    logits = model.domain_discriminator(feat_all).squeeze()
+                    loss_d = F.binary_cross_entropy_with_logits(logits, domain_labels.float())
+                    optimizer_d.zero_grad()
+                    loss_d.backward()
+                    optimizer_d.step()
+
+                # ---- Step B: 主干更新 + λ₂ warm-up ----
+                lambda2 = get_lambda2(e, step, args.n_epoch, max_step)
 
                 if args.use_amp:
                     with autocast():
                         clf_loss, transfer_loss, Dm, Dt = model.forward_stage2(
-                            mid=data_mid, target=data_target, mid_label=label_mid
+                            mid=data_mid, target=data_target, mid_label=label_mid, lambda2=lambda2
                         )
                         loss = clf_loss + transfer_loss
-                    optimizer.zero_grad()  # 梯度清零
+                    optimizer_g.zero_grad()
                     scaler.scale(loss).backward()
-                    scaler.step(optimizer)
+                    scaler.step(optimizer_g)
                     scaler.update()
+
+                    # 在AMP模式下，Dm和Dt可能是半精度的，需要转换为float32
+                    if step % 100 == 0:
+                        with torch.no_grad():
+                            # 将Dm和Dt转换为float32
+                            Dm_float = Dm.float()
+                            Dt_float = Dt.float()
+                            pred_m = (torch.sigmoid(Dm_float) > 0.5).float()
+                            pred_t = (torch.sigmoid(Dt_float) > 0.5).float()
+                            acc_m = (pred_m == 0).float().mean()  # 中间域应该被预测为0
+                            acc_t = (pred_t == 1).float().mean()  # 目标域应该被预测为1
+                            logging.info(f"Step {step}: D_acc_mid={acc_m:.4f}, D_acc_tgt={acc_t:.4f}")
                 else:
                     clf_loss, transfer_loss, Dm, Dt = model.forward_stage2(
-                        mid=data_mid, target=data_target, mid_label=label_mid
+                        mid=data_mid, target=data_target, mid_label=label_mid, lambda2=lambda2
                     )
                     loss = clf_loss + transfer_loss
-                    optimizer.zero_grad()  # 梯度清零
+                    optimizer_g.zero_grad()
                     loss.backward()
-                    optimizer.step()
+                    optimizer_g.step()
 
-            # 损失统计
+                    # 在训练循环中添加
+                    if step % 100 == 0:
+                        # 计算判别器准确率
+                        with torch.no_grad():
+                            pred_m = (torch.sigmoid(Dm) > 0.5).float()
+                            pred_t = (torch.sigmoid(Dt) > 0.5).float()
+                            acc_m = (pred_m == 0).float().mean()  # 中间域应该被预测为0
+                            acc_t = (pred_t == 1).float().mean()  # 目标域应该被预测为1
+                            logging.info(f"Step {step}: D_acc_mid={acc_m:.4f}, D_acc_tgt={acc_t:.4f}")
+
+            # ===== 损失统计 =====
             train_loss_clf.update(float(clf_loss.detach()))
             train_loss_transfer.update(float(transfer_loss.detach()))
             train_loss_total.update(float(loss.detach()))
@@ -337,11 +411,9 @@ def train(source_loader, mid_loader, target_train_loader, target_test_loader, mo
         if scheduler is not None:
             scheduler.step()
 
-        # print(f"Dm: {Dm.mean().item()}, Dt: {Dt.mean().item()}")
-        # ====== 每个 epoch 测试 ======
         info = f"Epoch: [{e:2d}/{args.n_epoch}], cls_loss: {train_loss_clf.avg:.4f}, transfer_loss: {train_loss_transfer.avg:.4f}, total_loss: {train_loss_total.avg:.4f}"
         if not use_stage1:
-            info += f', Dm_mean: {Dm.mean().item()}, Dt_mean: {Dt.mean().item()}'
+            info += f', λ2={lambda2:.3f}, Dm_mean: {Dm.mean().item():.3f}, Dt_mean: {Dt.mean().item():.3f}'
 
         if args.datasets == "visda":
             test_acc, test_per_class_acc, test_loss = test(model, target_test_loader, args)
@@ -361,19 +433,20 @@ def train(source_loader, mid_loader, target_train_loader, target_test_loader, mo
         logging.info(info)
         tqdm.write(info)
         time.sleep(1)
-
-        # epoch 结束时再清理一次显存
         torch.cuda.empty_cache()
 
     tqdm.write(f"Transfer result: {best_acc:.4f}")
+
 
 def main():
     # os.environ["CUDA_VISIBLE_DEVICES"] = "6"
     parser = get_parser()
     args = parser.parse_args()
-    setattr(args, "device", torch.device('cuda:4' if torch.cuda.is_available() else 'cpu'))
+    setattr(args, "device", torch.device('cuda:1' if torch.cuda.is_available() else 'cpu'))
     set_random_seed(args.seed)
-    source_loader, mid_loader, target_train_loader, target_test_loader, num_class = load_data(args)
+    # source_loader, mid_loader, target_train_loader, target_test_loader, num_class = load_data(args)
+    source_loader, mid_loader, target_train_loader, target_test_loader, num_class = build_dataloaders(args)
+
     setattr(args, "num_class", num_class)
     setattr(args, "max_iter", 10000)
     log_dir = f'log/{args.model_name}/{args.datasets}/{args.src_domain}2{args.tgt_domain}'
@@ -384,12 +457,14 @@ def main():
     model = get_model(args)
     model.to(args.device)
     print(model)
-    optimizer = get_optimizer(model, args)
+    # optimizer = get_optimizer(model, args)
+    optimizer_g, optimizer_d = get_optimizers(model, args)
+    scheduler = get_lr_scheduler(optimizer_g, args) if args.scheduler else None
 
-    if args.scheduler:
-        scheduler = get_lr_scheduler(optimizer,args)
-    else:
-        scheduler = None
+    # if args.scheduler:
+    #     scheduler = get_lr_scheduler(optimizer,args)
+    # else:
+    #     scheduler = None
     print(f"Base Network: {args.model_name}")
     print(f"Source Domain: {args.src_domain}")
     print(f"Mid Domain: {args.mid_domain}")
@@ -402,7 +477,7 @@ def main():
     if args.clip:
         test(model, target_test_loader, args)
     else:
-        train(source_loader, mid_loader, target_train_loader, target_test_loader, model, optimizer, scheduler, args)
+        train(source_loader, mid_loader, target_train_loader, target_test_loader, model, optimizer_g, optimizer_d, scheduler, args)
     
 
 if __name__ == "__main__":
